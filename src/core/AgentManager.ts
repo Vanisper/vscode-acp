@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, ChildProcess, SpawnOptionsWithoutStdio } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { log, logError } from '../utils/Logger';
@@ -74,8 +74,9 @@ export class AgentManager extends EventEmitter {
 
   /**
    * Spawn an agent as a child process with stdin/stdout piped.
+   * @param cwd Working directory for the agent process (optional).
    */
-  spawnAgent(name: string, config: AgentConfigEntry): AgentInstance {
+  spawnAgent(name: string, config: AgentConfigEntry, cwd?: string): AgentInstance {
     const id = `agent_${this.nextId++}`;
     log(`Spawning agent "${name}" (${id}): ${config.command} ${(config.args || []).join(' ')}`);
 
@@ -99,10 +100,20 @@ export class AgentManager extends EventEmitter {
       log(`Using shell: ${shell} ${shellArgs.join(' ')}`);
       const shellName = shell.split('/').pop() || shell;
       sendEvent('agent/spawn/shell', { shell: shellName, useLoginFlag: String(useLoginFlag) });
-      return spawn(shell, shellArgs, {
+
+      // Prepare spawn options
+      const spawnOptions: SpawnOptionsWithoutStdio = {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, ...(config.env || {}) },
-      });
+      };
+
+      // Add cwd if provided
+      if (cwd) {
+        spawnOptions.cwd = cwd;
+        log(`AgentManager: spawning agent with cwd=${cwd}`);
+      }
+
+      return spawn(shell, shellArgs, spawnOptions);
     })();
 
     const instance: AgentInstance = { id, name, process: child, config };
