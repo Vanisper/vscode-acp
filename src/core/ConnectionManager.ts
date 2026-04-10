@@ -9,6 +9,7 @@ import { FileSystemHandler } from '../handlers/FileSystemHandler';
 import { TerminalHandler } from '../handlers/TerminalHandler';
 import { PermissionHandler } from '../handlers/PermissionHandler';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
+import { AgentProcessError } from '../errors/AgentProcessError';
 import { log, logError, logTraffic } from '../utils/Logger';
 import { version as extensionVersion } from '../../package.json';
 
@@ -71,22 +72,73 @@ export class ConnectionManager {
       tappedStream,
     );
 
-    // Initialize the connection
-    log(`ConnectionManager: initializing connection to agent ${agentId}`);
-    const initResponse = await connection.initialize({
-      protocolVersion: PROTOCOL_VERSION,
-      clientInfo: {
-        name: 'vscode-acp-client',
-        version: extensionVersion,
-      },
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
-        terminal: true,
-      },
+    // Collect stderr output for better error messages
+    const stderrBuffer: string[] = [];
+    const stderrHandler = (data: Buffer) => {
+      stderrBuffer.push(data.toString().trim());
+    };
+    process.stderr?.on('data', stderrHandler);
+
+    // Create a promise that rejects if the process exits
+    const processExitPromise = new Promise<never>((_, reject) => {
+      process.once('close', (code, signal) => {
+        // Remove stderr handler
+        process.stderr?.off('data', stderrHandler);
+        reject(new AgentProcessError(
+          `Agent process exited (code=${code}, signal=${signal}) during connection`,
+          stderrBuffer,
+          code,
+          signal
+        ));
+      });
+      process.once('error', (err) => {
+        // Remove stderr handler
+        process.stderr?.off('data', stderrHandler);
+        reject(new AgentProcessError(
+          `Agent process error during connection: ${err.message}`,
+          stderrBuffer,
+          null,
+          null
+        ));
+      });
     });
+
+    // Create a timeout promise (30 seconds)
+    const timeoutMs = 30000;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`Connection timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+
+    // Initialize the connection with timeout and process exit detection
+    log(`ConnectionManager: initializing connection to agent ${agentId}`);
+    let initResponse: InitializeResponse;
+    try {
+      initResponse = await Promise.race([
+        connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientInfo: {
+            name: 'vscode-acp-client',
+            version: extensionVersion,
+          },
+          clientCapabilities: {
+            fs: {
+              readTextFile: true,
+              writeTextFile: true,
+            },
+            terminal: true,
+          },
+        }),
+        processExitPromise,
+        timeoutPromise,
+      ]);
+    } catch (e: any) {
+      // Clean up streams on error
+      void readable.cancel().catch(() => {});
+      void writable.close().catch(() => {});
+      throw e;
+    }
 
     log(`ConnectionManager: initialized. Agent: ${initResponse.agentInfo?.name || 'unknown'} v${initResponse.agentInfo?.version || '?'}`);
 

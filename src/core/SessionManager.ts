@@ -7,6 +7,8 @@ import { RequestError } from '@agentclientprotocol/sdk';
 import { AgentManager } from './AgentManager';
 import { ConnectionManager, ConnectionInfo } from './ConnectionManager';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
+import { AgentProcessError } from '../errors/AgentProcessError';
+import { AgentCancellationError } from '../errors/AgentCancellationError';
 import { getAgentConfigs } from '../config/AgentConfig';
 import { log, logError } from '../utils/Logger';
 import { sendEvent, sendError } from '../utils/TelemetryManager';
@@ -22,6 +24,10 @@ export interface SessionInfo {
   modes: SessionModeState | null;
   models: SessionModelState | null;
   availableCommands: AvailableCommand[];
+}
+
+export interface ConnectOptions {
+  signal?: AbortSignal;
 }
 
 /**
@@ -46,13 +52,41 @@ export class SessionManager extends EventEmitter {
     super();
   }
 
+  private isCancelled(error: unknown, signal?: AbortSignal): boolean {
+    if (signal?.aborted) {
+      return true;
+    }
+
+    return AgentCancellationError.isCancellationError(error);
+  }
+
+  private throwIfCancelled(signal: AbortSignal | undefined, action: string, agentId?: string): void {
+    if (!signal?.aborted) {
+      return;
+    }
+
+    if (agentId) {
+      this.connectionManager.removeConnection(agentId);
+      this.agentManager.killAgent(agentId);
+    }
+
+    throw new AgentCancellationError(`${action} cancelled by user.`);
+  }
+
+  /** Helper: a promise that never resolves (for Promise.race when no signal provided) */
+  private neverResolvingPromise(): Promise<never> {
+    return new Promise(() => {});
+  }
+
   /**
    * Connect to an agent and start chatting.
    * Only one agent can be connected at a time — automatically disconnects
    * any previously connected agent.
    * Internally creates a session via ACP protocol.
    */
-  async connectToAgent(agentName: string): Promise<SessionInfo> {
+  async connectToAgent(agentName: string, options?: ConnectOptions): Promise<SessionInfo> {
+    const signal = options?.signal;
+
     // If we already have a live session with this agent, reuse it
     const existingSessionId = this.agentSessions.get(agentName);
     if (existingSessionId && this.sessions.has(existingSessionId)) {
@@ -81,10 +115,21 @@ export class SessionManager extends EventEmitter {
     const cwd = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || process.cwd();
     log(`SessionManager: using cwd=${cwd} for agent "${agentName}"`);
 
+    // Set up abort handler outside try block so it's available in finally
+    let onAbort: (() => void) | undefined;
+
     try {
       // Spawn the agent process with the resolved cwd
       const agentInstance = this.agentManager.spawnAgent(agentName, config, cwd);
       const agentId = agentInstance.id;
+
+      onAbort = () => {
+        log(`Connection to ${agentName} cancelled by user`);
+        this.connectionManager.removeConnection(agentId);
+        this.agentManager.killAgent(agentId);
+      };
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
 
       // Listen for agent errors/close
       this.agentManager.on('agent-error', (evt: { agentId: string; error: Error }) => {
@@ -120,14 +165,26 @@ export class SessionManager extends EventEmitter {
 
       let connInfo: ConnectionInfo;
       try {
-        connInfo = await this.connectionManager.connect(agentId, agentProcess.process);
+        // Create user cancellation promise for faster response
+        const userCancelPromise = signal ? new Promise<never>((_, reject) => {
+          signal.addEventListener('abort', () => {
+            reject(new AgentCancellationError(`Connection to ${agentName} cancelled by user.`));
+          }, { once: true });
+        }) : this.neverResolvingPromise();
+
+        connInfo = await Promise.race([
+          this.connectionManager.connect(agentId, agentProcess.process),
+          userCancelPromise,
+        ]);
+        this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
       } catch (e) {
         this.agentManager.killAgent(agentId);
         throw e;
       }
 
       // Create ACP session (with auth handling)
-      const sessionInfo = await this.createAcpSession(agentName, agentId, connInfo, cwd);
+      const sessionInfo = await this.createAcpSession(agentName, agentId, connInfo, cwd, signal);
+      this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
 
       this.sessions.set(sessionInfo.sessionId, sessionInfo);
       this.agentSessions.set(agentName, sessionInfo.sessionId);
@@ -140,8 +197,24 @@ export class SessionManager extends EventEmitter {
       sendEvent('agent/connect.end', { agentName, result: 'success' }, { duration: Date.now() - connectStartTime });
       return sessionInfo;
     } catch (e: any) {
+      // Prioritize actual agent errors over cancellation signal
+      if (e instanceof AgentProcessError) {
+        sendError('agent/connect.end', { agentName, result: 'error', errorMessage: e.message }, { duration: Date.now() - connectStartTime });
+        throw e;
+      }
+
+      // Only treat as cancellation if not a process error
+      if (this.isCancelled(e, signal)) {
+        sendEvent('agent/connect.end', { agentName, result: 'cancelled' }, { duration: Date.now() - connectStartTime });
+        throw new AgentCancellationError(`Connection to ${agentName} cancelled by user.`);
+      }
+
       sendError('agent/connect.end', { agentName, result: 'error', errorMessage: e.message || String(e) }, { duration: Date.now() - connectStartTime });
       throw e;
+    } finally {
+      if (onAbort) {
+        signal?.removeEventListener('abort', onAbort);
+      }
     }
   }
 
@@ -195,13 +268,17 @@ export class SessionManager extends EventEmitter {
     agentId: string,
     connInfo: ConnectionInfo,
     cwd: string,
+    signal?: AbortSignal,
   ): Promise<SessionInfo> {
+    this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
+
     let sessionResponse: NewSessionResponse;
     try {
       sessionResponse = await connInfo.connection.newSession({
         cwd,
         mcpServers: [],
       });
+      this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
     } catch (e: any) {
       // Check for auth_required error (code -32000)
       const isAuthRequired = (e instanceof RequestError && e.code === -32000)
@@ -213,6 +290,8 @@ export class SessionManager extends EventEmitter {
         this.agentManager.killAgent(agentId);
         throw e;
       }
+
+      this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
 
       // Auth required — gather available methods
       const authMethods = connInfo.initResponse.authMethods;
@@ -264,10 +343,15 @@ export class SessionManager extends EventEmitter {
         await connInfo.connection.authenticate({ methodId: selectedMethod.id });
         log('Authentication successful');
       } catch (authErr: any) {
+        if (this.isCancelled(authErr, signal)) {
+          this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
+        }
         logError('Authentication failed', authErr);
         this.agentManager.killAgent(agentId);
         throw new Error(`Authentication failed: ${authErr.message}`);
       }
+
+      this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
 
       // Retry session/new after successful authentication
       try {
@@ -275,7 +359,11 @@ export class SessionManager extends EventEmitter {
           cwd,
           mcpServers: [],
         });
+        this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
       } catch (retryErr) {
+        if (this.isCancelled(retryErr, signal)) {
+          this.throwIfCancelled(signal, `Connection to ${agentName}`, agentId);
+        }
         logError('Failed to create session after authentication', retryErr);
         this.agentManager.killAgent(agentId);
         throw retryErr;
