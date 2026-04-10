@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'node:child_process';
+import { spawn, ChildProcess, SpawnOptionsWithoutStdio } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { log, logError } from '../utils/Logger';
@@ -102,7 +102,7 @@ export class AgentManager extends EventEmitter {
       sendEvent('agent/spawn/shell', { shell: shellName, useLoginFlag: String(useLoginFlag) });
 
       // Prepare spawn options
-      const spawnOptions: any = {
+      const spawnOptions: SpawnOptionsWithoutStdio = {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, ...(config.env || {}) },
       };
