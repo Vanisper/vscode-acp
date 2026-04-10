@@ -118,10 +118,16 @@ export function activate(context: vscode.ExtensionContext): void {
         {
           location: vscode.ProgressLocation.Notification,
           title: `Connecting to ${agentName}...`,
-          cancellable: false,
+          cancellable: true,
         },
-        async () => {
-          await sessionManager.connectToAgent(agentName!);
+        async (progress, token) => {
+          // Convert CancellationToken to AbortSignal
+          const controller = new AbortController();
+          token.onCancellationRequested(() => {
+            controller.abort();
+          });
+
+          await sessionManager.connectToAgent(agentName!, { signal: controller.signal });
         },
       );
     } catch (e: any) {
