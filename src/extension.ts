@@ -7,6 +7,7 @@ import { SessionUpdateHandler } from './handlers/SessionUpdateHandler';
 import { SessionTreeProvider } from './ui/SessionTreeProvider';
 import { StatusBarManager } from './ui/StatusBarManager';
 import { ChatWebviewProvider } from './ui/ChatWebviewProvider';
+import { ErrorHandler } from './errors/ErrorHandler';
 import { getAgentNames } from './config/AgentConfig';
 import { fetchRegistry } from './config/RegistryClient';
 import { log, logError, disposeChannels, getOutputChannel, getTrafficChannel } from './utils/Logger';
@@ -125,7 +126,13 @@ export function activate(context: vscode.ExtensionContext): void {
       );
     } catch (e: any) {
       logError('Failed to connect to agent', e);
-      vscode.window.showErrorMessage(`Failed to connect: ${e.message}`);
+
+      // Use ErrorHandler to provide better error messages
+      const handled = await ErrorHandler.handleConnectionError(e, agentName);
+      if (!handled) {
+        // Fallback to standard error message
+        vscode.window.showErrorMessage(`Failed to connect: ${e.message}`);
+      }
     }
   });
 

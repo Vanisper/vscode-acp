@@ -9,6 +9,7 @@ import { FileSystemHandler } from '../handlers/FileSystemHandler';
 import { TerminalHandler } from '../handlers/TerminalHandler';
 import { PermissionHandler } from '../handlers/PermissionHandler';
 import { SessionUpdateHandler } from '../handlers/SessionUpdateHandler';
+import { AgentProcessError } from '../errors/AgentProcessError';
 import { log, logError, logTraffic } from '../utils/Logger';
 import { version as extensionVersion } from '../../package.json';
 
@@ -71,13 +72,34 @@ export class ConnectionManager {
       tappedStream,
     );
 
+    // Collect stderr output for better error messages
+    const stderrBuffer: string[] = [];
+    const stderrHandler = (data: Buffer) => {
+      stderrBuffer.push(data.toString().trim());
+    };
+    process.stderr?.on('data', stderrHandler);
+
     // Create a promise that rejects if the process exits
     const processExitPromise = new Promise<never>((_, reject) => {
       process.once('close', (code, signal) => {
-        reject(new Error(`Agent process exited (code=${code}, signal=${signal}) during connection`));
+        // Remove stderr handler
+        process.stderr?.off('data', stderrHandler);
+        reject(new AgentProcessError(
+          `Agent process exited (code=${code}, signal=${signal}) during connection`,
+          stderrBuffer,
+          code,
+          signal
+        ));
       });
       process.once('error', (err) => {
-        reject(new Error(`Agent process error during connection: ${err.message}`));
+        // Remove stderr handler
+        process.stderr?.off('data', stderrHandler);
+        reject(new AgentProcessError(
+          `Agent process error during connection: ${err.message}`,
+          stderrBuffer,
+          null,
+          null
+        ));
       });
     });
 
