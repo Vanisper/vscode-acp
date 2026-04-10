@@ -71,22 +71,52 @@ export class ConnectionManager {
       tappedStream,
     );
 
-    // Initialize the connection
-    log(`ConnectionManager: initializing connection to agent ${agentId}`);
-    const initResponse = await connection.initialize({
-      protocolVersion: PROTOCOL_VERSION,
-      clientInfo: {
-        name: 'vscode-acp-client',
-        version: extensionVersion,
-      },
-      clientCapabilities: {
-        fs: {
-          readTextFile: true,
-          writeTextFile: true,
-        },
-        terminal: true,
-      },
+    // Create a promise that rejects if the process exits
+    const processExitPromise = new Promise<never>((_, reject) => {
+      process.once('close', (code, signal) => {
+        reject(new Error(`Agent process exited (code=${code}, signal=${signal}) during connection`));
+      });
+      process.once('error', (err) => {
+        reject(new Error(`Agent process error during connection: ${err.message}`));
+      });
     });
+
+    // Create a timeout promise (30 seconds)
+    const timeoutMs = 30000;
+    const timeoutPromise = new Promise<never>((_, reject) => {
+      setTimeout(() => {
+        reject(new Error(`Connection timeout after ${timeoutMs}ms`));
+      }, timeoutMs);
+    });
+
+    // Initialize the connection with timeout and process exit detection
+    log(`ConnectionManager: initializing connection to agent ${agentId}`);
+    let initResponse: InitializeResponse;
+    try {
+      initResponse = await Promise.race([
+        connection.initialize({
+          protocolVersion: PROTOCOL_VERSION,
+          clientInfo: {
+            name: 'vscode-acp-client',
+            version: extensionVersion,
+          },
+          clientCapabilities: {
+            fs: {
+              readTextFile: true,
+              writeTextFile: true,
+            },
+            terminal: true,
+          },
+        }),
+        processExitPromise,
+        timeoutPromise,
+      ]);
+    } catch (e: any) {
+      // Clean up streams on error
+      void readable.cancel().catch(() => {});
+      void writable.close().catch(() => {});
+      throw e;
+    }
 
     log(`ConnectionManager: initialized. Agent: ${initResponse.agentInfo?.name || 'unknown'} v${initResponse.agentInfo?.version || '?'}`);
 
